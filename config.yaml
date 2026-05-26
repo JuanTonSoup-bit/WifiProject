@@ -2,7 +2,7 @@
 # All values shown are defaults. Override per-machine as needed.
 
 network:
-  pi_ip: "192.168.1.86"          # Pi's Ethernet IP (eth0)
+  pi_ip: "192.168.1.81"          # Pi's Ethernet IP (eth0)
   pc_ip: "192.168.1.208"         # PC's Ethernet IP (eth0)
   udp_port: 5500                 # CSI stream port (Pi -> PC)
   buffer_size: 4194304           # Socket receive buffer in bytes (4 MB)
