@@ -1,0 +1,33 @@
+[Unit]
+Description=WiFi CSI Capture and UDP Streaming
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=wifi-csi
+Group=wifi-csi
+
+ExecStartPre=/usr/local/bin/wifi-csi-monitor
+ExecStart=/usr/bin/python3 /usr/local/lib/wifi-csi-streamer.py --config /etc/wifi-csi/config.yaml
+
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+WatchdogSec=30
+NotifyAccess=none
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wifi-csi-capture
+
+EnvironmentFile=-/etc/wifi-csi/environment
+
+# Give access to raw network sockets (needed for monitor mode)
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

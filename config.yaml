@@ -1,0 +1,96 @@
+# WiFi CSI Motion Detection System - Master Configuration
+# All values shown are defaults. Override per-machine as needed.
+
+network:
+  pi_ip: "192.168.2.50"          # Pi's Ethernet IP (eth0)
+  pc_ip: "192.168.2.100"         # PC's Ethernet IP (eth0)
+  udp_port: 5500                 # CSI stream port (Pi -> PC)
+  buffer_size: 4194304           # Socket receive buffer in bytes (4 MB)
+  socket_timeout_s: 5.0          # UDP recv timeout before checking shutdown flag
+
+ingestion:
+  ring_buffer_size: 500          # Max frames buffered before drops
+  max_gap_warn: 5                # Log warning if seq gap exceeds this
+  worker_threads: 1              # Receiver threads (1 is sufficient for 100 Hz)
+  log_level: "INFO"
+  stats_interval_s: 10           # Print ingestion stats every N seconds
+
+dsp:
+  window_size: 50                # Frames per sliding window (0.5s at 100 Hz)
+  window_stride: 5               # Emit window every N new frames (20 Hz output)
+  amplitude_smoothing_alpha: 0.15  # EMA per-subcarrier smoothing (0=none, 1=no history)
+  phase_unwrap: true             # Apply np.unwrap before phase diff
+  detrend: true                  # Remove linear trend from amplitude window
+  hampel_window: 5               # Hampel filter half-window size
+  hampel_n_sigma: 3.0            # Hampel outlier threshold in sigma units
+  baseline_frames: 300           # Initial static baseline collection (3s at 100 Hz)
+  baseline_update_alpha: 0.001   # Slow drift update rate after baseline established
+  variance_percentile: 90        # Percentile of subcarrier variances used as motion score
+  normalization: "zscore"        # "zscore", "minmax", or "none"
+  log_level: "INFO"
+
+detection:
+  motion_threshold: 0.40         # motion_score above this triggers MOTION_PENDING
+  motion_clear_threshold: 0.20   # motion_score below this clears motion (hysteresis gap)
+  motion_confirm_frames: 3       # Consecutive above-threshold windows to confirm motion
+  motion_clear_frames: 10        # Consecutive below-threshold windows to confirm clear
+  adaptive_threshold: true       # Enable adaptive threshold based on ambient distribution
+  adaptive_window_s: 60          # History window for adaptive baseline (seconds)
+  adaptive_k: 3.0                # Threshold = mean + k * std of vacant scores
+  adaptive_min_threshold: 0.10   # Hard floor for adaptive threshold
+  adaptive_max_threshold: 0.80   # Hard ceiling for adaptive threshold
+  min_motion_duration_ms: 200    # Suppress motion_end for sub-200ms bursts (filter glitches)
+  max_score_spike_ratio: 5.0     # Single-frame scores > ratio*recent_mean are suppressed
+  occupancy_timeout_s: 30        # Declare vacant after this many seconds with no motion
+  log_level: "INFO"
+  stats_interval_s: 10
+
+visualization:
+  update_rate_hz: 20             # FuncAnimation target update rate
+  history_seconds: 30            # Time window shown in motion score plot
+  window_title: "WiFi CSI Motion Detector"
+  theme: "dark"                  # "dark" or "light"
+  show_motion_score: true
+  show_amplitude_heatmap: true
+  show_event_timeline: true
+  show_stats_panel: true
+  show_raw_amplitude: true
+  heatmap_n_subcarriers: 64      # Show first N subcarriers in heatmap
+  heatmap_colormap: "viridis"
+  heatmap_vmin: 0
+  heatmap_vmax: null             # null = auto-scale
+  port: 5503                     # Web UI port
+
+transmitter:
+  target_ip: "192.168.1.100"     # Pi's WiFi IP (NOT Ethernet)
+  target_port: 9999              # UDP port on Pi for traffic
+  rate_hz: 100                   # Target packet transmission rate
+  packet_size_bytes: 64          # Payload size (minimum for reliable CSI extraction)
+  method: "udp"                  # "udp", "broadcast"
+  broadcast_addr: "255.255.255.255"
+  ramp_up_seconds: 2.0           # Slow-start duration before reaching full rate
+  status_interval_s: 5           # Report stats to PC every N seconds
+  log_level: "INFO"
+
+csi:
+  interface: "wlan0"             # Pi WiFi interface for monitor mode
+  channel: 6                     # WiFi channel to monitor (must match laptop's channel)
+  bandwidth: 20                  # MHz: 20, 40, or 80
+  monitor_mac: ""                # Filter by source MAC (empty = all frames)
+
+pi:
+  log_level: "INFO"
+  stats_interval_s: 10
+  health_port: 8080
+
+logging:
+  log_dir: "logs"
+  max_bytes: 10485760            # 10 MB per log file
+  backup_count: 5
+  log_level: "INFO"
+  enable_jsonl_events: true      # Write events to logs/events.jsonl
+  enable_csv_events: false       # Write events to logs/events.csv
+
+control:
+  host: "127.0.0.1"
+  port: 5599                     # Local TCP control socket for diagnostics CLI

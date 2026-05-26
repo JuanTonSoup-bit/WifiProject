@@ -1,0 +1,18 @@
+[Unit]
+Description=WiFi CSI Health Monitor HTTP Endpoint
+After=wifi-csi-capture.service
+Wants=wifi-csi-capture.service
+
+[Service]
+Type=simple
+User=wifi-csi
+Group=wifi-csi
+ExecStart=/usr/bin/python3 /usr/local/lib/wifi-csi-health.py --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wifi-csi-health
+
+[Install]
+WantedBy=multi-user.target

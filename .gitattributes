@@ -1,0 +1,14 @@
+# Keep LF endings for files that must execute on Linux/macOS
+*.sh        text eol=lf
+*.service   text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+
+# Windows-only files keep CRLF
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
+
+# Auto-detect for everything else
+*           text=auto
