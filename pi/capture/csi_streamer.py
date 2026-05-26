@@ -63,7 +63,7 @@ def setup_logging(log_level: str, log_dir: str = "/var/log/wifi-csi") -> logging
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
-    "network": {"pc_ip": "192.168.2.100", "udp_port": 5500},
+    "network": {"pc_ip": "192.168.2.208", "udp_port": 5500},
     "csi": {"interface": "wlan0", "channel": 6, "bandwidth": 20},
     "pi": {"log_level": "INFO", "stats_interval_s": 10},
 }
