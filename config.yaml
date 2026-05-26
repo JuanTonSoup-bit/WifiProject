@@ -2,8 +2,8 @@
 # All values shown are defaults. Override per-machine as needed.
 
 network:
-  pi_ip: "192.168.2.50"          # Pi's Ethernet IP (eth0)
-  pc_ip: "192.168.2.100"         # PC's Ethernet IP (eth0)
+  pi_ip: "192.168.1.86"          # Pi's Ethernet IP (eth0)
+  pc_ip: "192.168.1.208"         # PC's Ethernet IP (eth0)
   udp_port: 5500                 # CSI stream port (Pi -> PC)
   buffer_size: 4194304           # Socket receive buffer in bytes (4 MB)
   socket_timeout_s: 5.0          # UDP recv timeout before checking shutdown flag
@@ -62,7 +62,7 @@ visualization:
   port: 5503                     # Web UI port
 
 transmitter:
-  target_ip: "192.168.1.100"     # Pi's WiFi IP (NOT Ethernet)
+  target_ip: "192.168.1.86"     # Pi's WiFi IP (NOT Ethernet)
   target_port: 9999              # UDP port on Pi for traffic
   rate_hz: 100                   # Target packet transmission rate
   packet_size_bytes: 64          # Payload size (minimum for reliable CSI extraction)
