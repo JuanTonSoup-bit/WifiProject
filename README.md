@@ -48,13 +48,63 @@ cd wifi-csi-detector
 
 ### Raspberry Pi
 
-```bash
-# SSH into Pi after cloning the repo there
-cd wifi-csi-detector
-pip3 install -r pi/requirements.txt
+> **Kernel 6.x (Pi OS Bookworm/Trixie) — use manual steps below.**
+> `setup_nexmon.sh` is for the old kernel 5.10 method only.
 
-# Full Nexmon setup (run once, takes ~15 min):
-sudo bash pi/scripts/setup_nexmon.sh
+SSH into the Pi and run these once (~20 min):
+
+**1. Dependencies**
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y git libgmp3-dev gawk qpdf bison flex make autoconf libtool texinfo xxd libnl-3-dev libnl-genl-3-dev bc libssl-dev tcpdump
+```
+
+**2. 32-bit library support (required by nexmon build tools)**
+```bash
+sudo dpkg --add-architecture armhf && sudo apt update
+sudo apt-get install -y libc6:armhf libisl23:armhf libmpfr6:armhf libmpc3:armhf libstdc++6:armhf
+sudo ln -s /usr/lib/arm-linux-gnueabihf/libisl.so.23 /usr/lib/arm-linux-gnueabihf/libisl.so.10
+sudo ln -s /usr/lib/arm-linux-gnueabihf/libmpfr.so.6 /usr/lib/arm-linux-gnueabihf/libmpfr.so.4
+```
+
+**3. Python 2.7 (required by nexmon build tools)**
+```bash
+sudo cp /etc/apt/sources.list /tmp/sources.list.bak
+echo 'deb http://archive.debian.org/debian/ stretch contrib main non-free' | sudo tee -a /etc/apt/sources.list
+sudo apt update && sudo apt install -y python2.7
+sudo cp /tmp/sources.list.bak /etc/apt/sources.list && sudo apt update
+```
+
+**4. Clone and build nexmon**
+```bash
+git clone --depth=1 https://github.com/seemoo-lab/nexmon.git
+cd nexmon
+source setup_env.sh
+sed -i '1 s/$/2.7/' $NEXMON_ROOT/buildtools/b43-v3/debug/b43-beautifier
+make
+```
+
+**5. Build and install nexutil**
+```bash
+cd $NEXMON_ROOT/utilities/nexutil
+sudo -E make install USE_VENDOR_CMD=1
+sudo setcap cap_net_admin+ep /usr/bin/nexutil
+```
+
+**6. Clone nexmon_csi and install firmware (Pi 4 - BCM43455)**
+```bash
+cd $NEXMON_ROOT/patches/bcm43455c0/7_45_189
+git clone --depth=1 https://github.com/seemoo-lab/nexmon_csi.git
+cd nexmon_csi
+make -f Makefile.rpi install-firmware
+make -f Makefile.rpi unmanage
+make -f Makefile.rpi reload-full
+```
+
+**7. Install project Python dependencies**
+```bash
+cd ~/WifiProject
+pip3 install -r pi/requirements.txt
 ```
 
 ### Laptop
@@ -113,11 +163,6 @@ journalctl -u wifi-csi-capture -f
 # Check health endpoint
 curl http://localhost:8080/health
 # Expected: {"status":"ok","capture_hz":98.5,"dropped_frames":0,"uptime_s":12.0}
-```
-
-If you haven't run `setup_nexmon.sh` yet, do that first (one-time setup):
-```bash
-sudo bash pi/scripts/setup_nexmon.sh
 ```
 
 ---
@@ -393,7 +438,7 @@ See [docs/troubleshooting.md](docs/troubleshooting.md) for solutions to:
 
 | Component | Requirement |
 |-----------|-------------|
-| Raspberry Pi | Pi 4 (any RAM), Raspberry Pi OS Lite 64-bit |
+| Raspberry Pi | Pi 4 (any RAM), Pi OS Lite 64-bit Bookworm or newer (kernel 6.x) |
 | PC | Python 3.9+, Linux or Windows, Ethernet port |
 | Laptop | Python 3.9+, WiFi, same network as Pi |
 | Network | Dedicated Ethernet cable between Pi and PC |
