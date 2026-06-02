@@ -4,6 +4,7 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
+WARN=0
 CONFIG="/etc/wifi-csi/config.yaml"
 
 check() {
@@ -20,20 +21,19 @@ check() {
 
 echo "=== WiFi CSI Pre-flight Check ==="
 
-# 1. Nexmon kernel module
-if lsmod | grep -q brcmfmac; then
-    check "Nexmon brcmfmac module loaded" "ok"
+# 1. ESP32 #1 at /dev/ttyUSB0
+if [ -c /dev/ttyUSB0 ]; then
+    check "ESP32 #1 present (/dev/ttyUSB0)" "ok"
 else
-    check "Nexmon brcmfmac module loaded" "module not loaded (run: modprobe brcmfmac)"
+    check "ESP32 #1 present (/dev/ttyUSB0)" "device not found (check USB connection)"
 fi
 
-# 2. Monitor mode
-IFACE="wlan0"
-MODE=$(iw dev "$IFACE" info 2>/dev/null | grep -oP 'type \K\w+' || echo "unknown")
-if [[ "$MODE" == "monitor" ]]; then
-    check "wlan0 in monitor mode" "ok"
+# 2. ESP32 #2 at /dev/ttyUSB1 (optional — WARN only)
+if [ -c /dev/ttyUSB1 ]; then
+    check "ESP32 #2 present (/dev/ttyUSB1)" "ok"
 else
-    check "wlan0 in monitor mode" "mode=$MODE (run: configure_monitor.sh)"
+    echo "  [WARN] ESP32 #2 present (/dev/ttyUSB1): device not found (port2 is optional)"
+    ((WARN++))
 fi
 
 # 3. Config file
@@ -61,11 +61,11 @@ else
     check "Python yaml module" "not installed (pip3 install pyyaml)"
 fi
 
-# 6. nexutil
-if command -v nexutil &>/dev/null; then
-    check "nexutil installed" "ok"
+# 6. Python serial module
+if python3 -c "import serial" 2>/dev/null; then
+    check "Python serial module" "ok"
 else
-    check "nexutil installed" "not found (build from nexmon repo)"
+    check "Python serial module" "not installed (pip3 install pyserial)"
 fi
 
 # 7. CSI streamer script
@@ -76,5 +76,5 @@ else
 fi
 
 echo ""
-echo "Results: $PASS passed, $FAIL failed"
+echo "Results: $PASS passed, $FAIL failed, $WARN warned"
 [[ $FAIL -eq 0 ]]

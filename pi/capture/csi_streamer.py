@@ -1,311 +1,299 @@
-#!/usr/bin/env python3
-"""
-Nexmon CSI capture and UDP streaming daemon.
-
-Reads CSI packets emitted by Nexmon on localhost UDP, re-packages them in
-the shared wire format, and streams to the PC over Ethernet UDP.
-"""
+"""Pi-side CSI capture daemon: dual ESP32 serial readers streaming UDP frames to PC."""
 
 from __future__ import annotations
 
 import argparse
-import logging
-import logging.handlers
+import json
 import os
+import queue
 import signal
 import socket
 import struct
-import sys
+import threading
 import time
-from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
+import serial
 import yaml
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-NEXMON_MAGIC = b'\x11\x11\x11\x11'
-NEXMON_LOCAL_PORT = 5500          # Nexmon writes here by default
-SHARED_MAGIC = b'\xC5\x49\x31\x00'
-
-# Shared wire format header: magic(4) + ts_ns(8) + seq(4) + n_sub(2) + n_rx(1)
-#   + n_tx(1) + bw(1) + rssi(1) + noise(2) + pad(2)
-SHARED_HEADER_FMT = ">4sQIHBBBbh2s"
-SHARED_HEADER_SIZE = struct.calcsize(SHARED_HEADER_FMT)  # 26
-
-# Nexmon CSI header (binary layout from nexmon_csi source)
-NEXMON_HDR_FMT = ">IbB6sHHHH"
-NEXMON_HDR_SIZE = struct.calcsize(NEXMON_HDR_FMT)
-
-SUBCARRIERS_BY_BW = {20: 64, 40: 128, 80: 256}
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-def setup_logging(log_level: str, log_dir: str = "/var/log/wifi-csi") -> logging.Logger:
-    os.makedirs(log_dir, exist_ok=True)
-    fmt = "%(asctime)s [%(levelname)-5s] %(name)s: %(message)s"
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, "csi_streamer.log"),
-            maxBytes=10 * 1024 * 1024,
-            backupCount=3,
-        ),
-    ]
-    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO),
-                        format=fmt, handlers=handlers)
-    return logging.getLogger("csi_streamer")
+import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-DEFAULT_CONFIG = {
-    "network": {"pc_ip": "192.168.1.208", "udp_port": 5500},
-    "csi": {"interface": "wlan0", "channel": 6, "bandwidth": 20},
-    "pi": {"log_level": "INFO", "stats_interval_s": 10},
+MAGIC = b"\xC5\x49\x31\x00"
+HEADER_FORMAT = ">4sQIHBBBbh2s"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+
+STATS_PATH = Path("/run/wifi-csi/streamer_stats.json")
+RECONNECT_DELAY_S = 2.0
+QUEUE_MAXSIZE = 512
+
+_DEFAULTS = {
+    "baud_rate": 921600,
+    "n_subcarriers": 64,
+    "pc_ip": "192.168.1.208",
+    "udp_port": 5500,
+    "stats_interval_s": 10.0,
 }
 
-def load_config(path: str) -> dict:
-    if not os.path.exists(path):
-        return DEFAULT_CONFIG
-    with open(path, "r") as fh:
-        cfg = yaml.safe_load(fh) or {}
-    # Merge with defaults
-    for section, defaults in DEFAULT_CONFIG.items():
-        cfg.setdefault(section, {})
-        for k, v in defaults.items():
-            cfg[section].setdefault(k, v)
-    return cfg
+
+@dataclass
+class ParsedFrame:
+    timestamp_ns: int
+    rssi: int
+    noise_floor: int
+    bandwidth_mhz: int
+    n_subcarriers: int
+    csi_complex: np.ndarray
 
 
-# ---------------------------------------------------------------------------
-# Nexmon packet parsing
-# ---------------------------------------------------------------------------
-def parse_nexmon_packet(data: bytes, bandwidth: int) -> Optional[dict]:
-    """
-    Parse a raw Nexmon CSI UDP packet.
+@dataclass
+class _Stats:
+    frames_sent: int = 0
+    dropped_frames: int = 0
+    start_time: float = field(default_factory=time.monotonic)
 
-    Returns dict with rssi, n_rx, n_tx, n_subcarriers, csi_bytes, or None on error.
-    """
-    if len(data) < NEXMON_HDR_SIZE:
+    def to_dict(self, rate_hz: float) -> dict:
+        return {
+            "rate_hz": round(rate_hz, 2),
+            "dropped_frames": self.dropped_frames,
+            "frames_sent": self.frames_sent,
+            "uptime_s": round(time.monotonic() - self.start_time, 1),
+        }
+
+
+def _load_config(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with p.open("r") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _get(cfg: dict, *keys, default):
+    node = cfg
+    for k in keys:
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
+
+
+class _TimestampUnwrapper:
+    _WRAP_US: int = 1 << 32
+
+    def __init__(self) -> None:
+        self._offset_us: int = 0
+        self._last_us: Optional[int] = None
+
+    def to_ns(self, ts_us: int) -> int:
+        if self._last_us is not None and ts_us < self._last_us - self._WRAP_US // 2:
+            self._offset_us += self._WRAP_US
+        self._last_us = ts_us
+        return (self._offset_us + ts_us) * 1000
+
+
+def _parse_line(line: str) -> Optional[ParsedFrame]:
+    line = line.strip()
+    if not line.startswith("CSI_DATA"):
+        return None
+
+    bracket_open = line.find("[")
+    bracket_close = line.rfind("]")
+    if bracket_open == -1 or bracket_close == -1:
+        return None
+
+    header_str = line[:bracket_open].rstrip(",")
+    data_str = line[bracket_open + 1 : bracket_close]
+
+    cols = header_str.split(",")
+    if len(cols) < 24:
         return None
 
     try:
-        (magic, rssi, frame_ctrl, src_mac, seq_num,
-         core_spatial, chanspec, chip) = struct.unpack_from(NEXMON_HDR_FMT, data, 0)
-    except struct.error:
+        rssi = int(cols[3])
+        bandwidth_raw = int(cols[7])
+        noise_floor = int(cols[14])
+        local_ts_us = int(cols[18])
+        csi_len = int(cols[22])
+        first_word_invalid = int(cols[23])
+    except (ValueError, IndexError):
         return None
 
-    if magic != struct.unpack(">I", NEXMON_MAGIC)[0]:
+    if first_word_invalid:
         return None
 
-    n_subcarriers = SUBCARRIERS_BY_BW.get(bandwidth, 64)
-    csi_offset = NEXMON_HDR_SIZE
-    expected_csi_bytes = n_subcarriers * 4  # 2 bytes real + 2 bytes imag per subcarrier (int16)
-    if len(data) < csi_offset + expected_csi_bytes:
+    bandwidth_mhz = 40 if bandwidth_raw == 1 else 20
+    n_subcarriers = csi_len // 2
+
+    if not data_str.strip():
         return None
 
-    csi_raw = data[csi_offset: csi_offset + expected_csi_bytes]
-    return {
-        "rssi": rssi,
-        "n_rx": 1,
-        "n_tx": 1,
-        "n_subcarriers": n_subcarriers,
-        "bandwidth": bandwidth,
-        "csi_int16_bytes": csi_raw,
-    }
+    try:
+        raw_ints = [int(x) for x in data_str.split(",") if x.strip()]
+    except ValueError:
+        return None
 
+    if len(raw_ints) != csi_len:
+        return None
 
-def csi_int16_to_float32(csi_int16: bytes, n_subcarriers: int) -> bytes:
-    """
-    Convert Nexmon int16 complex CSI to float32 complex and return as LE bytes.
-    Nexmon stores: [real0, imag0, real1, imag1, ...] as int16.
-    Output: [real0, imag0, real1, imag1, ...] as float32 LE.
-    """
-    ints = struct.unpack(f"<{n_subcarriers * 2}h", csi_int16)
-    floats = [float(v) for v in ints]
-    return struct.pack(f"<{len(floats)}f", *floats)
+    raw = np.array(raw_ints, dtype=np.int8)
+    i_vals = raw[1::2].astype(np.float32)
+    q_vals = raw[0::2].astype(np.float32)
+    csi_complex = i_vals + 1j * q_vals
 
-
-def build_shared_packet(
-    nexmon: dict,
-    seq_num: int,
-    timestamp_ns: int,
-) -> bytes:
-    """Build the shared-format UDP packet from a parsed Nexmon frame."""
-    n_rx = nexmon["n_rx"]
-    n_tx = nexmon["n_tx"]
-    n_sub = nexmon["n_subcarriers"]
-    bw = nexmon["bandwidth"]
-    rssi = nexmon["rssi"]
-
-    csi_float32 = csi_int16_to_float32(nexmon["csi_int16_bytes"], n_sub)
-
-    header = struct.pack(
-        SHARED_HEADER_FMT,
-        SHARED_MAGIC,
-        timestamp_ns,
-        seq_num,
-        n_sub,
-        n_rx,
-        n_tx,
-        bw,
-        rssi,
-        -95,          # noise floor placeholder
-        b'\x00\x00',
+    return ParsedFrame(
+        timestamp_ns=local_ts_us * 1000,
+        rssi=rssi,
+        noise_floor=noise_floor,
+        bandwidth_mhz=bandwidth_mhz,
+        n_subcarriers=n_subcarriers,
+        csi_complex=csi_complex,
     )
-    return header + csi_float32
 
 
-# ---------------------------------------------------------------------------
-# Ring buffer (absorb bursts before forwarding)
-# ---------------------------------------------------------------------------
-class SendBuffer:
-    def __init__(self, maxsize: int = 200) -> None:
-        self._q: deque[bytes] = deque(maxlen=maxsize)
-        self._dropped = 0
+class ESP32Reader(threading.Thread):
+    def __init__(
+        self,
+        port: str,
+        baud: int,
+        frame_queue: "queue.Queue[ParsedFrame]",
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True, name=f"esp32-{port}")
+        self.port = port
+        self.baud = baud
+        self._queue = frame_queue
+        self._stop = stop_event
+        self._unwrap = _TimestampUnwrapper()
 
-    def put(self, pkt: bytes) -> None:
-        if len(self._q) >= self._q.maxlen:  # type: ignore[arg-type]
-            self._dropped += 1
-        self._q.append(pkt)
-
-    def get_all(self) -> list:
-        items = list(self._q)
-        self._q.clear()
-        return items
-
-    @property
-    def dropped(self) -> int:
-        return self._dropped
-
-
-# ---------------------------------------------------------------------------
-# Main streamer
-# ---------------------------------------------------------------------------
-class CSIStreamer:
-    def __init__(self, config: dict, logger: logging.Logger) -> None:
-        net = config["network"]
-        csi = config["csi"]
-        pi = config["pi"]
-
-        self._pc_ip = net["pc_ip"]
-        self._pc_port = int(net["udp_port"])
-        self._bandwidth = int(csi["bandwidth"])
-        self._stats_interval = float(pi["stats_interval_s"])
-
-        self._recv_sock: Optional[socket.socket] = None
-        self._send_sock: Optional[socket.socket] = None
-        self._running = False
-        self._seq = 0
-        self._buf = SendBuffer()
-        self._log = logger
-
-        self._frames_captured = 0
-        self._frames_sent = 0
-        self._start_time = 0.0
-        self._last_stats = 0.0
-
-    def start(self) -> None:
-        self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        self._recv_sock.settimeout(1.0)
-        self._recv_sock.bind(("127.0.0.1", NEXMON_LOCAL_PORT))
-
-        self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        self._running = True
-        self._start_time = time.monotonic()
-        self._last_stats = self._start_time
-        self._log.info("CSI streamer started. Forwarding to %s:%d", self._pc_ip, self._pc_port)
-
-        try:
-            self._run()
-        finally:
-            self._cleanup()
-
-    def _run(self) -> None:
-        while self._running:
+    def run(self) -> None:
+        while not self._stop.is_set():
             try:
-                data, _ = self._recv_sock.recvfrom(8192)
-            except socket.timeout:
-                continue
-
-            timestamp_ns = time.monotonic_ns()
-            nexmon = parse_nexmon_packet(data, self._bandwidth)
-            if nexmon is None:
-                continue
-
-            self._frames_captured += 1
-            pkt = build_shared_packet(nexmon, self._seq, timestamp_ns)
-            self._seq = (self._seq + 1) & 0xFFFFFFFF
-
-            try:
-                self._send_sock.sendto(pkt, (self._pc_ip, self._pc_port))
-                self._frames_sent += 1
-            except OSError as exc:
-                self._log.warning("Send error: %s", exc)
-
-            self._maybe_log_stats()
-
-    def _maybe_log_stats(self) -> None:
-        now = time.monotonic()
-        if now - self._last_stats >= self._stats_interval:
-            elapsed = now - self._start_time
-            rate = self._frames_sent / max(elapsed, 1)
-            self._log.info(
-                "Streamer stats: captured=%d sent=%d dropped=%d rate=%.1fHz uptime=%.0fs",
-                self._frames_captured, self._frames_sent, self._buf.dropped, rate, elapsed,
-            )
-            self._last_stats = now
-
-    def _cleanup(self) -> None:
-        if self._recv_sock:
-            self._recv_sock.close()
-        if self._send_sock:
-            self._send_sock.close()
-        self._log.info("Streamer stopped.")
-
-    def stop(self) -> None:
-        self._running = False
+                with serial.Serial(self.port, self.baud, timeout=1.0) as ser:
+                    while not self._stop.is_set():
+                        try:
+                            raw = ser.readline()
+                        except serial.SerialException:
+                            break
+                        if not raw:
+                            continue
+                        try:
+                            line = raw.decode("ascii", errors="replace")
+                        except Exception:
+                            continue
+                        frame = _parse_line(line)
+                        if frame is None:
+                            continue
+                        frame.timestamp_ns = self._unwrap.to_ns(frame.timestamp_ns // 1000)
+                        try:
+                            self._queue.put_nowait(frame)
+                        except queue.Full:
+                            pass
+            except (serial.SerialException, OSError):
+                if not self._stop.is_set():
+                    time.sleep(RECONNECT_DELAY_S)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def _pack(frame: ParsedFrame, seq_num: int) -> bytes:
+    header = struct.pack(
+        HEADER_FORMAT,
+        MAGIC,
+        frame.timestamp_ns,
+        seq_num,
+        frame.n_subcarriers,
+        1,
+        1,
+        frame.bandwidth_mhz,
+        max(-128, min(127, frame.rssi)),
+        max(-32768, min(32767, frame.noise_floor)),
+        b"\x00\x00",
+    )
+    floats = np.empty(len(frame.csi_complex) * 2, dtype=np.float32)
+    floats[0::2] = frame.csi_complex.real
+    floats[1::2] = frame.csi_complex.imag
+    return header + floats.astype("<f4").tobytes()
+
+
+def _write_stats(stats: _Stats, rate_hz: float) -> None:
+    try:
+        STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(stats.to_dict(rate_hz)))
+        tmp.replace(STATS_PATH)
+    except OSError:
+        pass
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Nexmon CSI UDP streamer")
+    parser = argparse.ArgumentParser(description="WiFi CSI dual-ESP32 streaming daemon")
     parser.add_argument("--config", default="/etc/wifi-csi/config.yaml")
-    parser.add_argument("--pc-ip")
-    parser.add_argument("--port", type=int)
-    parser.add_argument("--bandwidth", type=int, choices=[20, 40, 80])
-    parser.add_argument("--log-level", default=None)
+    parser.add_argument("--port1", required=True)
+    parser.add_argument("--port2", default=None)
+    parser.add_argument("--baud", type=int, default=None)
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    if args.pc_ip:
-        cfg["network"]["pc_ip"] = args.pc_ip
-    if args.port:
-        cfg["network"]["udp_port"] = args.port
-    if args.bandwidth:
-        cfg["csi"]["bandwidth"] = args.bandwidth
-    if args.log_level:
-        cfg["pi"]["log_level"] = args.log_level
+    cfg = _load_config(args.config)
 
-    log = setup_logging(cfg["pi"]["log_level"])
-    streamer = CSIStreamer(cfg, log)
+    baud = args.baud or _get(cfg, "esp32", "baud_rate", default=_DEFAULTS["baud_rate"])
+    pc_ip = _get(cfg, "network", "pc_ip", default=_DEFAULTS["pc_ip"])
+    udp_port = _get(cfg, "network", "udp_port", default=_DEFAULTS["udp_port"])
+    stats_interval = _get(cfg, "pi", "stats_interval_s", default=_DEFAULTS["stats_interval_s"])
 
-    def _handle_signal(sig, frame):
-        log.info("Received signal %d, shutting down...", sig)
-        streamer.stop()
+    stop_event = threading.Event()
 
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    def _shutdown(sig, frame):
+        stop_event.set()
 
-    streamer.start()
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    frame_queue: "queue.Queue[ParsedFrame]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+    readers: list[ESP32Reader] = []
+    for port in filter(None, [args.port1, args.port2]):
+        r = ESP32Reader(port, baud, frame_queue, stop_event)
+        r.start()
+        readers.append(r)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dest = (pc_ip, int(udp_port))
+
+    stats = _Stats()
+    seq_num = 0
+    last_stats_time = time.monotonic()
+    window_frames = 0
+
+    while not stop_event.is_set():
+        try:
+            frame: ParsedFrame = frame_queue.get(timeout=0.5)
+        except queue.Empty:
+            now = time.monotonic()
+            elapsed = now - last_stats_time
+            if elapsed >= stats_interval:
+                _write_stats(stats, window_frames / elapsed if elapsed > 0 else 0.0)
+                window_frames = 0
+                last_stats_time = now
+            continue
+
+        try:
+            sock.sendto(_pack(frame, seq_num), dest)
+            seq_num = (seq_num + 1) & 0xFFFFFFFF
+            stats.frames_sent += 1
+            window_frames += 1
+        except OSError:
+            stats.dropped_frames += 1
+
+        now = time.monotonic()
+        elapsed = now - last_stats_time
+        if elapsed >= stats_interval:
+            _write_stats(stats, window_frames / elapsed if elapsed > 0 else 0.0)
+            window_frames = 0
+            last_stats_time = now
+
+    sock.close()
+    for r in readers:
+        r.join(timeout=5.0)
 
 
 if __name__ == "__main__":

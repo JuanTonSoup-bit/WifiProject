@@ -74,7 +74,7 @@ transmitter:
 
 csi:
   interface: "wlan0"             # Pi WiFi interface for monitor mode
-  channel: 6                     # WiFi channel to monitor (must match laptop's channel)
+  channel: 1                     # WiFi channel to monitor (must match laptop's channel)
   bandwidth: 20                  # MHz: 20, 40, or 80
   monitor_mac: ""                # Filter by source MAC (empty = all frames)
 
@@ -94,3 +94,10 @@ logging:
 control:
   host: "127.0.0.1"
   port: 5599                     # Local TCP control socket for diagnostics CLI
+
+esp32:
+  port1: "/dev/ttyUSB0"           # First ESP32 serial port
+  port2: "/dev/ttyUSB1"           # Second ESP32 serial port (optional)
+  baud_rate: 921600               # Must match firmware SERIAL_BAUD
+  n_subcarriers: 64               # 64 for 20MHz LLTF, 128 for 40MHz
+  channel: 1                      # WiFi channel (must match transmitter)
