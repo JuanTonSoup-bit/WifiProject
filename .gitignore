@@ -34,6 +34,9 @@ captures/
 config.local.yaml
 .env
 
+# ESP32 WiFi credentials — never commit
+esp32/csi_collector/secrets.h
+
 # Test artifacts
 .pytest_cache/
 .coverage

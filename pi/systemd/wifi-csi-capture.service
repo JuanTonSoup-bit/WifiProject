@@ -8,7 +8,7 @@ Type=simple
 User=wifi-csi
 Group=wifi-csi
 
-ExecStart=/usr/bin/python3 /usr/local/lib/wifi-csi-streamer.py --config /etc/wifi-csi/config.yaml --port1 /dev/ttyUSB0 --port2 /dev/ttyUSB1
+ExecStart=/usr/bin/python3 /usr/local/lib/wifi-csi-streamer.py --config /etc/wifi-csi/config.yaml
 
 Restart=always
 RestartSec=3
@@ -23,10 +23,6 @@ StandardError=journal
 SyslogIdentifier=wifi-csi-capture
 
 EnvironmentFile=-/etc/wifi-csi/environment
-
-SupplementaryGroups=dialout
-DeviceAllow=/dev/ttyUSB0 rw
-DeviceAllow=/dev/ttyUSB1 rw
 
 [Install]
 WantedBy=multi-user.target

@@ -61,17 +61,6 @@ visualization:
   heatmap_vmax: null             # null = auto-scale
   port: 5503                     # Web UI port
 
-transmitter:
-  target_ip: "192.168.1.86"     # Pi's WiFi IP (NOT Ethernet)
-  target_port: 9999              # UDP port on Pi for traffic
-  rate_hz: 100                   # Target packet transmission rate
-  packet_size_bytes: 64          # Payload size (minimum for reliable CSI extraction)
-  method: "udp"                  # "udp", "broadcast"
-  broadcast_addr: "255.255.255.255"
-  ramp_up_seconds: 2.0           # Slow-start duration before reaching full rate
-  status_interval_s: 5           # Report stats to PC every N seconds
-  log_level: "INFO"
-
 csi:
   interface: "wlan0"             # Pi WiFi interface for monitor mode
   channel: 1                     # WiFi channel to monitor (must match laptop's channel)
@@ -96,8 +85,7 @@ control:
   port: 5599                     # Local TCP control socket for diagnostics CLI
 
 esp32:
-  port1: "/dev/ttyUSB0"           # First ESP32 serial port
-  port2: "/dev/ttyUSB1"           # Second ESP32 serial port (optional)
-  baud_rate: 921600               # Must match firmware SERIAL_BAUD
+  n_devices: 3                    # Number of ESP32 collectors
+  listen_port: 5600               # Pi listens on this UDP port for ESP32 CSI data
   n_subcarriers: 64               # 64 for 20MHz LLTF, 128 for 40MHz
-  channel: 1                      # WiFi channel (must match transmitter)
+  channel: 1                      # WiFi channel (informational — set by router)

@@ -1,10 +1,9 @@
-"""Pi-side CSI capture daemon: dual ESP32 serial readers streaming UDP frames to PC."""
+"""Pi-side CSI capture daemon: UDP listener for up to N ESP32s, streams to PC."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import queue
 import signal
 import socket
@@ -15,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import serial
 import yaml
 import numpy as np
 
@@ -25,12 +23,10 @@ HEADER_FORMAT = ">4sQIHBBBbh2s"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 STATS_PATH = Path("/run/wifi-csi/streamer_stats.json")
-RECONNECT_DELAY_S = 2.0
 QUEUE_MAXSIZE = 512
 
 _DEFAULTS = {
-    "baud_rate": 921600,
-    "n_subcarriers": 64,
+    "listen_port": 5600,
     "pc_ip": "192.168.1.208",
     "udp_port": 5500,
     "stats_interval_s": 10.0,
@@ -111,11 +107,11 @@ def _parse_line(line: str) -> Optional[ParsedFrame]:
         return None
 
     try:
-        rssi = int(cols[3])
-        bandwidth_raw = int(cols[7])
-        noise_floor = int(cols[14])
-        local_ts_us = int(cols[18])
-        csi_len = int(cols[22])
+        rssi            = int(cols[3])
+        bandwidth_raw   = int(cols[7])
+        noise_floor     = int(cols[14])
+        local_ts_us     = int(cols[18])
+        csi_len         = int(cols[22])
         first_word_invalid = int(cols[23])
     except (ValueError, IndexError):
         return None
@@ -152,47 +148,56 @@ def _parse_line(line: str) -> Optional[ParsedFrame]:
     )
 
 
-class ESP32Reader(threading.Thread):
+class UDPListener(threading.Thread):
+    """Listens on one UDP port for CSI_DATA lines from any number of ESP32s."""
+
     def __init__(
         self,
-        port: str,
-        baud: int,
+        listen_port: int,
         frame_queue: "queue.Queue[ParsedFrame]",
         stop_event: threading.Event,
     ) -> None:
-        super().__init__(daemon=True, name=f"esp32-{port}")
-        self.port = port
-        self.baud = baud
+        super().__init__(daemon=True, name="udp-listener")
+        self._port = listen_port
         self._queue = frame_queue
         self._stop = stop_event
-        self._unwrap = _TimestampUnwrapper()
+        self._unwrappers: dict[str, _TimestampUnwrapper] = {}
 
     def run(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        sock.bind(("", self._port))
+        sock.settimeout(0.5)
+
         while not self._stop.is_set():
             try:
-                with serial.Serial(self.port, self.baud, timeout=1.0) as ser:
-                    while not self._stop.is_set():
-                        try:
-                            raw = ser.readline()
-                        except serial.SerialException:
-                            break
-                        if not raw:
-                            continue
-                        try:
-                            line = raw.decode("ascii", errors="replace")
-                        except Exception:
-                            continue
-                        frame = _parse_line(line)
-                        if frame is None:
-                            continue
-                        frame.timestamp_ns = self._unwrap.to_ns(frame.timestamp_ns // 1000)
-                        try:
-                            self._queue.put_nowait(frame)
-                        except queue.Full:
-                            pass
-            except (serial.SerialException, OSError):
-                if not self._stop.is_set():
-                    time.sleep(RECONNECT_DELAY_S)
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            src_ip = addr[0]
+            if src_ip not in self._unwrappers:
+                self._unwrappers[src_ip] = _TimestampUnwrapper()
+
+            try:
+                line = data.decode("ascii", errors="replace")
+            except Exception:
+                continue
+
+            frame = _parse_line(line)
+            if frame is None:
+                continue
+
+            frame.timestamp_ns = self._unwrappers[src_ip].to_ns(frame.timestamp_ns // 1000)
+            try:
+                self._queue.put_nowait(frame)
+            except queue.Full:
+                pass
+
+        sock.close()
 
 
 def _pack(frame: ParsedFrame, seq_num: int) -> bytes:
@@ -226,18 +231,16 @@ def _write_stats(stats: _Stats, rate_hz: float) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="WiFi CSI dual-ESP32 streaming daemon")
+    parser = argparse.ArgumentParser(description="WiFi CSI UDP streaming daemon")
     parser.add_argument("--config", default="/etc/wifi-csi/config.yaml")
-    parser.add_argument("--port1", required=True)
-    parser.add_argument("--port2", default=None)
-    parser.add_argument("--baud", type=int, default=None)
+    parser.add_argument("--listen-port", type=int, default=None)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
 
-    baud = args.baud or _get(cfg, "esp32", "baud_rate", default=_DEFAULTS["baud_rate"])
-    pc_ip = _get(cfg, "network", "pc_ip", default=_DEFAULTS["pc_ip"])
-    udp_port = _get(cfg, "network", "udp_port", default=_DEFAULTS["udp_port"])
+    listen_port    = args.listen_port or _get(cfg, "esp32", "listen_port", default=_DEFAULTS["listen_port"])
+    pc_ip          = _get(cfg, "network", "pc_ip",       default=_DEFAULTS["pc_ip"])
+    udp_port       = _get(cfg, "network", "udp_port",    default=_DEFAULTS["udp_port"])
     stats_interval = _get(cfg, "pi", "stats_interval_s", default=_DEFAULTS["stats_interval_s"])
 
     stop_event = threading.Event()
@@ -250,11 +253,9 @@ def main() -> None:
 
     frame_queue: "queue.Queue[ParsedFrame]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
-    readers: list[ESP32Reader] = []
-    for port in filter(None, [args.port1, args.port2]):
-        r = ESP32Reader(port, baud, frame_queue, stop_event)
-        r.start()
-        readers.append(r)
+    listener = UDPListener(listen_port, frame_queue, stop_event)
+    listener.start()
+    print(f"Listening for ESP32s on UDP port {listen_port}, forwarding to {pc_ip}:{udp_port}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest = (pc_ip, int(udp_port))
@@ -292,8 +293,7 @@ def main() -> None:
             last_stats_time = now
 
     sock.close()
-    for r in readers:
-        r.join(timeout=5.0)
+    listener.join(timeout=5.0)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,16 @@
 # ESP32 CSI Collector Setup
 
-Switched from Nexmon (Pi firmware patching) to two ESP32-WROOM-32D boards as passive CSI receivers. Nexmon was abandoned due to a b43 assembler incompatibility on kernel 6.12.x — the `enable_carrier_search` label was missing from the disassembled ucode and there was no clean fix.
+Each ESP32-WROOM-32D connects to your home WiFi and streams CSI data over UDP to the Pi. No USB connection to the Pi is needed during operation — each board just needs a USB power source (charger or power bank).
 
-Each ESP32 connects to the Pi via USB and streams CSI data over serial at 921600 baud. The Pi reads both serial streams and forwards them to the PC over UDP.
+The Pi listens on UDP port 5600 and accepts streams from all three ESP32s simultaneously.
 
 ---
 
 ## Hardware
 
-- 2x Inland ESP32-WROOM-32D (Micro Center, ~$8 each)
-- 2x USB-A to Micro-USB cables
-- Both plug into the Pi's USB ports
+- 3x Inland ESP32-WROOM-32D
+- 3x USB power sources (chargers or power banks)
+- Place them around the room for spatial coverage
 
 ---
 
@@ -19,13 +19,13 @@ Each ESP32 connects to the Pi via USB and streams CSI data over serial at 921600
 ### 1. Install the ESP32 board package
 
 1. Open Arduino IDE 2.x
-2. **File > Preferences** → add this URL to "Additional boards manager URLs":
+2. **File > Preferences** → add to "Additional boards manager URLs":
    ```
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
    ```
 3. **Tools > Board > Boards Manager** → search `esp32` → install **esp32 by Espressif Systems version 2.0.15**
-   - Do NOT install 3.x — the CSI API changed and will break the sketch
-   - Do NOT install "Arduino ESP32 Boards" by Arduino — that's a different package
+   - Do NOT install 3.x — CSI API changed and will break the sketch
+   - Do NOT install "Arduino ESP32 Boards" by Arduino — wrong package
 
 ### 2. Select the board
 
@@ -33,59 +33,69 @@ Each ESP32 connects to the Pi via USB and streams CSI data over serial at 921600
 
 Set port to whichever COM port shows "(USB)" next to it.
 
-### 3. Open the sketch
+### 3. Create your secrets file
 
-**File > Open** → navigate to `esp32/csi_collector/csi_collector.ino`
+Copy `secrets.h.example` to `secrets.h` in the same folder:
+
+```
+esp32/csi_collector/secrets.h.example  →  esp32/csi_collector/secrets.h
+```
+
+Edit `secrets.h` with your WiFi credentials:
+```c
+#define WIFI_SSID     "your_network_name"
+#define WIFI_PASSWORD "your_password"
+```
+
+`secrets.h` is gitignored and will never be committed.
 
 ### 4. Check config.h
 
 ```c
-#define CHANNEL     1       // must match your router's 2.4 GHz channel
-#define SERIAL_BAUD 921600
+#define PI_IP    "192.168.1.81"   // Pi's ethernet IP
+#define UDP_PORT 5600             // Pi listens on this port
 ```
 
-Find your router's channel: on Windows run `netsh wlan show all` and look for the Channel line of your connected network. Update `CHANNEL` to match if needed.
+Update `PI_IP` if your Pi's address is different.
 
-### 5. Flash
+### 5. Flash each ESP32
 
-Click Upload (→). After it finishes, press the **EN** button on the board to reboot.
+1. Plug in via USB
+2. **Tools > Port** → select the USB COM port
+3. Click Upload (→)
+4. Open **Serial Monitor** at **115200 baud**
 
-Open **Tools > Serial Monitor** at **921600 baud**. You should see:
+You should see:
 ```
-CSI collector started on channel 1
-CSI_DATA,1,AA:BB:CC:DD:EE:FF,-65,...,[1,-2,3,...]
+Connecting to WiFi....
+Connected. IP: 192.168.1.xxx  ->  192.168.1.81:5600
+CSI collector running
 ```
 
-Repeat for the second ESP32.
+If it sits at `Connecting to WiFi.....` forever, double-check `secrets.h`.
+
+Repeat for all three ESP32s.
+
+### 6. Power for deployment
+
+Once flashed, each ESP32 just needs USB power — plug into a phone charger or power bank anywhere in the room. No PC or Pi connection needed.
 
 ---
 
-## Connecting to the Pi
-
-Plug both ESP32s into the Pi's USB ports. They will appear as:
-- `/dev/ttyUSB0` — ESP32 #1
-- `/dev/ttyUSB1` — ESP32 #2
-
-If the Pi doesn't recognize them, the `dialout` group permission is needed:
-```bash
-sudo usermod -aG dialout $USER
-# log out and back in
-```
-
----
-
-## Running the Streamer
+## Running the Pi Streamer
 
 On the Pi:
 
 ```bash
 cd ~/wifi-csi-detector
 source venv/bin/activate
-pip install -r pi/requirements.txt   # first time only: adds pyserial + numpy
-python -m pi.capture.csi_streamer --port1 /dev/ttyUSB0 --port2 /dev/ttyUSB1
+pip install -r pi/requirements.txt   # first time only
+python -m pi.capture.csi_streamer
 ```
 
-Or if running as a systemd service:
+The streamer listens on UDP port 5600 and accepts connections from any ESP32 automatically — no configuration needed when adding or removing boards.
+
+As a systemd service:
 ```bash
 sudo systemctl start wifi-csi-capture
 sudo journalctl -u wifi-csi-capture -f
@@ -99,7 +109,28 @@ sudo journalctl -u wifi-csi-capture -f
 bash pi/scripts/preflight_check.sh
 ```
 
-Checks that both ESP32 devices are present, config file exists, and Python dependencies are installed.
+---
+
+## Architecture
+
+```
+[Router / ambient WiFi traffic on channel 1]
+         |
+    (captured by all three ESP32s)
+         |
+[ESP32 #1] --WiFi UDP--> |              |
+[ESP32 #2] --WiFi UDP--> | Pi :5600     | --UDP--> PC :5500
+[ESP32 #3] --WiFi UDP--> |              |
+```
+
+No dedicated traffic generator needed. The ESP32s run in promiscuous mode and
+capture CSI from any WiFi frame on the channel — router beacons (~10 Hz),
+phone traffic, background app traffic, etc. Three receivers gives good spatial
+coverage for location-aware motion detection.
+
+All three ESP32s send to the same Pi port. The Pi tells them apart by source IP
+and maintains separate timestamp unwrappers per device. Frames from all devices
+are merged into one stream forwarded to the PC.
 
 ---
 
@@ -107,9 +138,8 @@ Checks that both ESP32 devices are present, config file exists, and Python depen
 
 | Problem | Fix |
 |---|---|
-| `wifi_pkt_rx_ctrl_t has no member 'sequence'` | Field doesn't exist in SDK 2.0.x — replaced with a static counter |
+| `wifi_pkt_rx_ctrl_t has no member 'sequence'` | Field doesn't exist in SDK 2.0.x — replaced with static counter |
 | `wifi_pkt_rx_ctrl_t has no member 'smoothing_not_apply'` | Renamed to `smoothing` in this SDK version |
-| Serial Monitor shows boxes/garbage for CSI values | `Serial.print((int8_t)val)` prints raw char bytes — fixed by casting to `int` first |
-| Serial Monitor blank after flash | Startup message fires before monitor opens — press EN button to reboot |
-| No CSI data (startup message visible but no CSI_DATA lines) | ESP32 needs promiscuous mode enabled to capture frames without connecting to an AP — added `esp_wifi_set_promiscuous(true)` |
-| No CSI data after enabling promiscuous mode | Router was on channel 1, sketch defaulted to channel 6 — updated `config.h` and `config.yaml` |
+| Serial Monitor shows boxes for CSI values | `Serial.print((int8_t)val)` prints raw char — cast to `int` first |
+| No CSI data — startup message visible but no CSI_DATA lines | Need `esp_wifi_set_promiscuous(true)` to capture without connecting to AP |
+| No CSI data after promiscuous mode | Router on channel 1, sketch defaulted to channel 6 |
